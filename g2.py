@@ -1,133 +1,229 @@
-import streamlit as st 
+# app.py  — African Natural Disaster Impact Predictor (XGBoost)
+import streamlit as st
 import pandas as pd
 import numpy as np
 import joblib
-from streamlit_option_menu import option_menu
+from pathlib import Path
+from datetime import datetime
 
-# ------------------------------------------------
-# PAGE CONFIGURATION
-# ------------------------------------------------
-st.set_page_config(page_title="Disaster Impact Predictor - Group 2", layout="wide")
+# =========================
+# Page Setup
+# =========================
+st.set_page_config(
+    page_title="African Natural Disaster Impact Predictor",
+    layout="wide",
+    page_icon="🌍"
+)
 
-# ------------------------------------------------
-# LOAD TRAINED ARTIFACTS (XGBoost + features)
-# ------------------------------------------------
-# Expect these files in the same folder as app.py
-MODEL_PATH = "xgb_disaster_model.pkl"      # trained on log1p(target)
-FEATS_PATH = "model_features.pkl"          # list of feature names (strings)
+# Minimal dark UI polish (adjust palette if you want exact colors)
+st.markdown("""
+<style>
+:root { --panel:#121621; --card:#151a26; --stroke:#2a3042; --pill:#1b1f2a; }
+[data-testid="stSidebar"]{background:#0f1116;border-right:1px solid var(--stroke);}
+.sidebar-card{background:#1b1f2a;padding:14px;border-radius:16px;border:1px solid var(--stroke);}
+.banner{background:var(--panel);border:1px solid var(--stroke);padding:14px 16px;border-radius:16px;}
+.badge{display:inline-block;padding:6px 10px;border-radius:999px;background:var(--pill);
+  border:1px solid var(--stroke);margin-right:6px;font-size:.85rem;}
+.result-card{background:var(--card);border:1px solid var(--stroke);padding:20px;border-radius:20px;}
+.result-big{font-size:2.6rem;font-weight:800;color:#ff6b6b;}
+.summary{background:var(--panel);border:1px solid var(--stroke);padding:14px;border-radius:16px;}
+.block-title{font-size:1.05rem;font-weight:700;margin:4px 0 10px 0;}
+</style>
+""", unsafe_allow_html=True)
 
-model = joblib.load(MODEL_PATH)
-X_columns = joblib.load(FEATS_PATH)
+# =========================
+# Load Artifacts
+# =========================
+@st.cache_resource
+def load_artifacts():
+    # All three PKLs must be in repo root
+    model = joblib.load("xgb_model.pkl")                  # Pipeline(SimpleImputer + XGBRegressor)
+    features = list(joblib.load("model_features_xgb.pkl"))# exact feature order
+    y_info = joblib.load("y_transform_xgb.pkl")           # {"transform":"log1p","inverse":"expm1"}
+    return model, features, y_info
 
-# ------------------------------------------------
-# SIDEBAR NAVIGATION (same layout vibe as your sample)
-# ------------------------------------------------
+model, MODEL_FEATURES, Y_INFO = load_artifacts()
+FEATURE_SET = set(MODEL_FEATURES)
+
+def inv_transform(yhat_log: np.ndarray) -> np.ndarray:
+    if (Y_INFO or {}).get("inverse") == "expm1":
+        return np.expm1(yhat_log)
+    return yhat_log
+
+# =========================
+# Safe Feature Mapping
+# =========================
+def set_if_exists(d:dict, col:str, value):
+    """Only set if feature exists in trained model."""
+    if col in FEATURE_SET:
+        d[col] = value
+
+def build_feature_row(params: dict) -> pd.DataFrame:
+    """
+    Build a 1-row DataFrame in the exact feature order the model expects.
+    Any feature not explicitly set here is left at 0 (safe default).
+    """
+    x = {c: 0 for c in MODEL_FEATURES}
+
+    # Core time features (common in your dataset)
+    set_if_exists(x, "Year", params["year"])
+    set_if_exists(x, "Start Year", params["year"])
+    set_if_exists(x, "End Year", params["year"])
+    set_if_exists(x, "Start Month", params["month"])
+    set_if_exists(x, "End Month", params["month"])
+    set_if_exists(x, "Seq", 1)
+
+    # User “expected” priors (only applied if such columns exist)
+    set_if_exists(x, "Total Deaths", params["exp_deaths"])
+    set_if_exists(x, "No Injured", params["exp_injured"])
+    set_if_exists(x, "No Homeless", params["exp_homeless"])
+
+    # Region / Disaster one-hots — try common naming styles
+    region = params["region"]; disaster = params["disaster"]
+    for pat in [f"Region_{region}", f"Africa_Region_{region}", f"Region:{region}", region]:
+        set_if_exists(x, pat, 1)
+    for pat in [f"Disaster_{disaster}", f"Disaster Type_{disaster}", f"Disaster:{disaster}", disaster]:
+        set_if_exists(x, pat, 1)
+
+    # Economic/damage placeholders if present in your features
+    for guess in [
+        "Aid Contribution ('000 US$)",
+        "Reconstruction Costs ('000 US$)",
+        "Insured Damages ('000 US$)",
+        "Total Damages ('000 US$)"
+    ]:
+        set_if_exists(x, guess, 0)
+
+    return pd.DataFrame([[x[c] for c in MODEL_FEATURES]], columns=MODEL_FEATURES)
+
+def predict_one(params: dict) -> float:
+    Xrow = build_feature_row(params)
+    yhat_log = model.predict(Xrow)
+    return float(inv_transform(yhat_log)[0])
+
+# =========================
+# Sidebar Controls
+# =========================
 with st.sidebar:
+    st.markdown('<div class="sidebar-card">', unsafe_allow_html=True)
+    st.markdown("### 🎯 Disaster Prediction Parameters")
+
+    regions = ["Eastern Africa","Western Africa","Northern Africa","Middle Africa","Southern Africa"]
+    disasters = ["Flood","Drought","Storm","Epidemic","Earthquake","Landslide","Wildfire"]
+
+    region = st.selectbox("Select African Region", regions, index=0)
+    disaster = st.selectbox("Disaster Type", disasters, index=0)
+
+    current_year = datetime.utcnow().year
+    year = st.number_input("Year", min_value=1990, max_value=2100, value=current_year, step=1)
+    month = st.slider("Month", 1, 12, 6)
+
+    st.markdown("### 📊 Expected Impact Metrics")
+    c1, c2 = st.columns(2)
+    with c1:
+        exp_deaths   = st.number_input("🕯 Expected Deaths",   min_value=0, value=50,   step=1)
+        exp_injured  = st.number_input("🩺 Expected Injuries",  min_value=0, value=200,  step=1)
+    with c2:
+        exp_homeless = st.number_input("🏚 Expected Homeless", min_value=0, value=1000, step=1)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================
+# Top Banner + Tabs
+# =========================
+st.title("🌍 African Natural Disaster Impact Predictor")
+
+leftBanner, rightBanner = st.columns([3,1])
+with leftBanner:
     st.markdown(
-        "<h3 style='margin-bottom: 10px; color: #92400e;'>📑 Navigation</h3>",
+        f"""
+        <div class="banner">
+          <span class="badge">🔮 Predicting disaster impacts across African regions</span>
+          <span class="badge">📈 Model: XGBoost Regressor</span>
+          <span class="badge">🧩 Features: {len(MODEL_FEATURES)}</span>
+        </div>
+        """,
         unsafe_allow_html=True
     )
-    selected = option_menu(
-        menu_title=None,
-        options=["Home", "Predictor", "About"],
-        icons=["house", "bar-chart", "info-circle"],
-        default_index=1,
-        styles={
-            "container": {"padding": "0!important", "background-color": "#fef3c7"},
-            "icon": {"color": "#92400e", "font-size": "20px"},
-            "nav-link": {
-                "font-size": "16px",
-                "color": "#000000",
-                "--hover-color": "#fde68a"
-            },
-            "nav-link-selected": {
-                "background-color": "#fcd34d",
-                "color": "#000000"
-            },
+with rightBanner:
+    st.metric("Model R² (val)", "—")  # put your true R² if you saved it
+
+tabs = st.tabs(["🔴 Prediction", "📊 Analytics", "🧠 Model Info", "✅ Recommendations"])
+
+# =========================
+# Prediction Tab
+# =========================
+with tabs[0]:
+    st.write("")
+    predict_btn = st.button("🚨 Predict Disaster Impact", use_container_width=True)
+
+    colL, colR = st.columns([2,1], gap="large")
+    if predict_btn:
+        params = {
+            "region": region,
+            "disaster": disaster,
+            "year": int(year),
+            "month": int(month),
+            "exp_deaths": int(exp_deaths),
+            "exp_injured": int(exp_injured),
+            "exp_homeless": int(exp_homeless),
         }
-    )
-
-# ------------------------------------------------
-# HOME TAB
-# ------------------------------------------------
-if selected == "Home":
-    st.title("🏠 Welcome to the Disaster Impact Predictor - Group 2")
-    st.write(
-        "This tool estimates the number of people potentially affected by a disaster "
-        "using a tuned XGBoost model trained on historical records."
-    )
-
-# ------------------------------------------------
-# PREDICTOR TAB
-# ------------------------------------------------
-elif selected == "Predictor":
-    st.title("📊 Disaster Impact Prediction")
-    st.write("Provide the details to estimate the *Total Affected*.")
-
-    # If your training included categorical encodings, place your mappings here.
-    # Leave empty if your model used numeric-only features.
-    disaster_group_options = {"Biological": 0, "Climatological": 1, "Geophysical": 2, "Hydrological": 3, "Meteorological": 4, "Technological": 5}
-    disaster_type_options  = {"Flood": 0, "Earthquake": 1, "Storm": 2, "Epidemic": 3}
-    country_options        = {"Ghana": 0, "Nigeria": 1, "Kenya": 2, "South Africa": 3}
-    region_options         = {"Africa": 0, "Asia": 1, "Europe": 2, "Americas": 3}
-
-    # Build inputs dynamically from the saved feature list
-    vals = {}
-    for col in X_columns:
-        label = col.replace("_", " ").title()
-        low = col.lower()
-
-        if low == "year":
-            vals[col] = st.number_input(label, min_value=1900, max_value=2100, value=2023, step=1)
-
-        elif low == "disaster_group":
-            choice = st.selectbox(label, list(disaster_group_options.keys()))
-            vals[col] = disaster_group_options[choice]
-
-        elif low == "disaster_type":
-            choice = st.selectbox(label, list(disaster_type_options.keys()))
-            vals[col] = disaster_type_options[choice]
-
-        elif low == "country":
-            choice = st.selectbox(label, list(country_options.keys()))
-            vals[col] = country_options[choice]
-
-        elif low == "region":
-            choice = st.selectbox(label, list(region_options.keys()))
-            vals[col] = region_options[choice]
-
-        # Common numeric features from your PDF (edit as needed)
-        elif low in ["total_deaths", "number_injured", "number_affected", "number_homeless"]:
-            vals[col] = st.number_input(label, min_value=0.0, value=0.0, step=1.0)
-
-        else:
-            # Default numeric input for any other feature
-            vals[col] = st.number_input(label, value=0.0, step=1.0)
-
-    # Convert to DataFrame in the exact column order expected by the model
-    input_df = pd.DataFrame([vals], columns=X_columns).replace([np.inf, -np.inf], np.nan).fillna(0)
-
-    # Predict
-    if st.button("Predict Affected People"):
         try:
-            # Model was trained on log1p(target), so we inverse-transform with expm1
-            log_pred = model.predict(input_df.values)
-            pred = np.expm1(log_pred)  # back to original scale
-            st.success(f"📌 Estimated Number of People Affected: {float(pred[0]):,.0f}")
-        except Exception as e:
-            st.error("🚫 Prediction failed.")
-            st.code(str(e))
-            st.write("Expected columns (training order):", X_columns)
-            st.write("Current input shape:", input_df.shape)
+            y = predict_one(params)
+            with colL:
+                st.markdown('<div class="result-card">', unsafe_allow_html=True)
+                st.markdown("#### 🧾 Prediction Results")
+                st.markdown(f"<div class='result-big'>{y:,.0f} people</div> expected to be affected.", unsafe_allow_html=True)
+                st.caption("Note: Estimate depends on available predictors and historical patterns.")
+                st.markdown("</div>", unsafe_allow_html=True)
 
-# ------------------------------------------------
-# ABOUT TAB
-# ------------------------------------------------
-elif selected == "About":
-    st.title("ℹ About This App")
+            with colR:
+                st.markdown('<div class="summary">', unsafe_allow_html=True)
+                st.markdown("### 🗂 Input Summary")
+                st.write(f"*Region:* {region}")
+                st.write(f"*Disaster:* {disaster}")
+                st.write(f"*Year:* {year}")
+                st.write(f"*Month:* {month}")
+                st.write(f"*Expected Deaths:* {exp_deaths}")
+                st.write(f"*Expected Injuries:* {exp_injured}")
+                st.write(f"*Expected Homeless:* {exp_homeless}")
+                st.markdown("</div>", unsafe_allow_html=True)
+        except Exception as e:
+            st.error("Prediction failed. Your trained features may not match these controls.")
+            with st.expander("See error details"):
+                st.write(str(e))
+    else:
+        st.info("Set parameters on the left, then click *Predict Disaster Impact*.")
+
+# =========================
+# Analytics Tab
+# =========================
+with tabs[1]:
+    st.subheader("Feature Vector Preview (what goes into the model)")
+    preview = build_feature_row({
+        "region": region, "disaster": disaster, "year": int(year), "month": int(month),
+        "exp_deaths": int(exp_deaths), "exp_injured": int(exp_injured), "exp_homeless": int(exp_homeless),
+    })
+    st.dataframe(preview, use_container_width=True)
+    st.caption("Exact columns and order the model receives.")
+
+# =========================
+# Model Info Tab
+# =========================
+with tabs[2]:
+    st.subheader("Model & Features")
+    st.write("- *Algorithm:* XGBoost Regressor (wrapped in a scikit-learn Pipeline with SimpleImputer).")
+    st.write(f"- *Features used:* {len(MODEL_FEATURES)}")
+    st.code(", ".join(MODEL_FEATURES[:80]) + ("..." if len(MODEL_FEATURES) > 80 else ""))
+
+# =========================
+# Recommendations Tab
+# =========================
+with tabs[3]:
+    st.subheader("Operational Recommendations (General)")
     st.markdown("""
-*Model*: Tuned XGBoost Regressor trained on log1p(Total Affected) and numeric features.  
-*Artifacts*: xgb_disaster_model.pkl, model_features.pkl (saved with joblib).  
-*Prediction*: We apply expm1 on the model output to return to the original scale.  
-*Purpose*: Support preparedness and resource planning with quick, consistent estimates.
+- *Early Warning & Communication:* Use radio/SMS/community alerts 48–72 hours before peak risk.
+- *Resource Staging:* Pre-position medical kits, shelter materials, and water treatment in regional hubs.
+- *Evacuation Readiness:* Confirm routes/transport for vulnerable groups.
+- *Post-Event Triage:* Set up triage near shelters; log headcount and injuries.
+- *Data Feedback:* After events, record outcomes to improve future predictions.
 """)
