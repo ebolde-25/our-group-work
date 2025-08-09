@@ -1,4 +1,4 @@
-# app.py  — African Natural Disaster Impact Predictor (XGBoost)
+# app.py — African Natural Disaster Impact Predictor (XGBoost)
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -9,13 +9,7 @@ from datetime import datetime
 # =========================
 # Page Setup
 # =========================
-st.set_page_config(
-    page_title="African Natural Disaster Impact Predictor",
-    layout="wide",
-    page_icon="🌍"
-)
-
-# Minimal dark UI polish (adjust palette if you want exact colors)
+st.set_page_config(page_title="African Natural Disaster Impact Predictor", layout="wide", page_icon="🌍")
 st.markdown("""
 <style>
 :root { --panel:#121621; --card:#151a26; --stroke:#2a3042; --pill:#1b1f2a; }
@@ -32,21 +26,38 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =========================
-# Load Artifacts
+# Load Artifacts (PKLs)
 # =========================
 @st.cache_resource
 def load_artifacts():
-    # All three PKLs must be in repo root
-    model = joblib.load("xgb_model.pkl")                  # Pipeline(SimpleImputer + XGBRegressor)
-    features = list(joblib.load("model_features_xgb.pkl"))# exact feature order
-    y_info = joblib.load("y_transform_xgb.pkl")           # {"transform":"log1p","inverse":"expm1"}
-    return model, features, y_info
+    model = joblib.load("xgb_model.pkl")                 # Pipeline(SimpleImputer + XGBRegressor)
+    features = list(joblib.load("model_features_xgb.pkl"))
+    yinfo = None
+    yinfo_path = Path("y_transform_xgb.pkl")
+    if yinfo_path.exists():
+        try:
+            yinfo = joblib.load(yinfo_path)
+        except Exception:
+            yinfo = None
+    return model, features, yinfo
 
 model, MODEL_FEATURES, Y_INFO = load_artifacts()
 FEATURE_SET = set(MODEL_FEATURES)
 
+# If y_transform file is missing, give the user a simple switch
+if not Y_INFO:
+    st.warning("No y_transform_xgb.pkl found. Choose how to treat model output below.")
+    transform_choice = st.radio(
+        "Output transformation",
+        ["Identity (already in original scale)", "Invert log1p (use expm1)"],
+        index=1,  # default to expm1 since many trainings used log1p
+        horizontal=True
+    )
+    Y_INFO = {"transform": None, "inverse": "expm1" if "exp" in transform_choice else "identity"}
+
 def inv_transform(yhat_log: np.ndarray) -> np.ndarray:
-    if (Y_INFO or {}).get("inverse") == "expm1":
+    inv = (Y_INFO or {}).get("inverse", "identity")
+    if inv == "expm1":
         return np.expm1(yhat_log)
     return yhat_log
 
@@ -54,18 +65,13 @@ def inv_transform(yhat_log: np.ndarray) -> np.ndarray:
 # Safe Feature Mapping
 # =========================
 def set_if_exists(d:dict, col:str, value):
-    """Only set if feature exists in trained model."""
     if col in FEATURE_SET:
         d[col] = value
 
 def build_feature_row(params: dict) -> pd.DataFrame:
-    """
-    Build a 1-row DataFrame in the exact feature order the model expects.
-    Any feature not explicitly set here is left at 0 (safe default).
-    """
     x = {c: 0 for c in MODEL_FEATURES}
 
-    # Core time features (common in your dataset)
+    # Time features (common in your dataset)
     set_if_exists(x, "Year", params["year"])
     set_if_exists(x, "Start Year", params["year"])
     set_if_exists(x, "End Year", params["year"])
@@ -73,19 +79,19 @@ def build_feature_row(params: dict) -> pd.DataFrame:
     set_if_exists(x, "End Month", params["month"])
     set_if_exists(x, "Seq", 1)
 
-    # User “expected” priors (only applied if such columns exist)
+    # Expected priors (only if those columns exist)
     set_if_exists(x, "Total Deaths", params["exp_deaths"])
     set_if_exists(x, "No Injured", params["exp_injured"])
     set_if_exists(x, "No Homeless", params["exp_homeless"])
 
-    # Region / Disaster one-hots — try common naming styles
+    # Region/Disaster one-hots — try common patterns
     region = params["region"]; disaster = params["disaster"]
     for pat in [f"Region_{region}", f"Africa_Region_{region}", f"Region:{region}", region]:
         set_if_exists(x, pat, 1)
     for pat in [f"Disaster_{disaster}", f"Disaster Type_{disaster}", f"Disaster:{disaster}", disaster]:
         set_if_exists(x, pat, 1)
 
-    # Economic/damage placeholders if present in your features
+    # Economic/damage placeholders if such columns exist
     for guess in [
         "Aid Contribution ('000 US$)",
         "Reconstruction Costs ('000 US$)",
@@ -98,8 +104,9 @@ def build_feature_row(params: dict) -> pd.DataFrame:
 
 def predict_one(params: dict) -> float:
     Xrow = build_feature_row(params)
-    yhat_log = model.predict(Xrow)
-    return float(inv_transform(yhat_log)[0])
+    yhat = model.predict(Xrow)
+    y = inv_transform(yhat)
+    return float(y[0])
 
 # =========================
 # Sidebar Controls
@@ -145,7 +152,7 @@ with leftBanner:
         unsafe_allow_html=True
     )
 with rightBanner:
-    st.metric("Model R² (val)", "—")  # put your true R² if you saved it
+    st.metric("Model R² (val)", "—")  # optional: show your real metric
 
 tabs = st.tabs(["🔴 Prediction", "📊 Analytics", "🧠 Model Info", "✅ Recommendations"])
 
